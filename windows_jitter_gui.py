@@ -120,6 +120,15 @@ _xinput.XInputGetState.restype = DWORD
 ERROR_SUCCESS = 0
 
 
+def xinput_get_triggers(index: int) -> Optional[tuple[int, int]]:
+    state = XINPUT_STATE()
+    res = _xinput.XInputGetState(DWORD(index), ctypes.byref(state))
+    if res != ERROR_SUCCESS:
+        return None
+    gp = state.Gamepad
+    return int(gp.bLeftTrigger), int(gp.bRightTrigger)
+
+
 def xinput_get_r2_value(index: int) -> Optional[int]:
     state = XINPUT_STATE()
     res = _xinput.XInputGetState(DWORD(index), ctypes.byref(state))
@@ -141,6 +150,10 @@ class JitterMouse:
         # Pull (recoil) in pixels per second along X (right +) and Y (down +)
         self._pull_dx_per_sec = 0.0
         self._pull_dy_per_sec = 0.0
+        # Low-pass smoothing for circle delta (EMA on per-tick deltas)
+        self._smooth_alpha = 0.15
+        self._smooth_dx_prev = 0.0
+        self._smooth_dy_prev = 0.0
 
         self._active = False
         self._active_lock = threading.Lock()
@@ -161,6 +174,9 @@ class JitterMouse:
         rad = math.radians(angle_deg)
         self._pull_dx_per_sec = float(magnitude_px_per_sec) * math.cos(rad)
         self._pull_dy_per_sec = float(magnitude_px_per_sec) * math.sin(rad)
+
+    def update_smoothing(self, alpha: float) -> None:
+        self._smooth_alpha = max(0.0, min(0.95, float(alpha)))
 
     def update_params(self, radius_px: Optional[float] = None, events_per_second: Optional[float] = None, rotations_per_second: Optional[float] = None) -> None:
         with self._param_lock:
@@ -241,14 +257,25 @@ class JitterMouse:
                     continue
 
                 # Circular component
-                dx_f = radius * (cur_cos - last_cos)
-                dy_f = radius * (cur_sin - last_sin)
+                raw_dx = radius * (cur_cos - last_cos)
+                raw_dy = radius * (cur_sin - last_sin)
                 last_cos = cur_cos
                 last_sin = cur_sin
 
                 # Recoil pull component (constant drift per second)
                 drift_x = self._pull_dx_per_sec * step_seconds
                 drift_y = self._pull_dy_per_sec * step_seconds
+
+                # Apply smoothing only to the circular component to keep recoil strong
+                alpha = self._smooth_alpha
+                if alpha > 0.0:
+                    self._smooth_dx_prev = (1.0 - alpha) * self._smooth_dx_prev + alpha * raw_dx
+                    self._smooth_dy_prev = (1.0 - alpha) * self._smooth_dy_prev + alpha * raw_dy
+                    dx_f = self._smooth_dx_prev
+                    dy_f = self._smooth_dy_prev
+                else:
+                    dx_f = raw_dx
+                    dy_f = raw_dy
 
                 residual_x += dx_f + drift_x
                 residual_y += dy_f + drift_y
@@ -264,15 +291,17 @@ class JitterMouse:
 
 
 class R2Monitor:
-    def __init__(self, controller_index: int, threshold: int, toggle_mode: bool, jitter: JitterMouse, ui_callback=None, backend: str = "auto", sdl_axis_index: int = -1, poll_interval_s: float = 0.002) -> None:
+    def __init__(self, controller_index: int, threshold: int, toggle_mode: bool, jitter: JitterMouse, ui_callback=None, backend: str = "auto", sdl_axis_l2_index: int = -1, sdl_axis_r2_index: int = -1, poll_interval_s: float = 0.002, trigger: str = "r2") -> None:
         self.index = int(controller_index)
         self.threshold = max(0, min(255, int(threshold)))
         self.toggle_mode = bool(toggle_mode)
         self.jitter = jitter
         self.ui_callback = ui_callback  # function(active: bool)
         self.backend = backend.lower() if backend else "auto"
-        self.sdl_axis_index = int(sdl_axis_index)
+        self.sdl_axis_l2_index = int(sdl_axis_l2_index)
+        self.sdl_axis_r2_index = int(sdl_axis_r2_index)
         self.poll_interval_s = float(max(0.001, poll_interval_s))
+        self.trigger = (trigger or "r2").lower()
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -332,13 +361,20 @@ class R2Monitor:
         # Inform UI that backend is XInput
         self._signal_ui(False, backend_label="XInput", analog_01=0.0)
         while not self._stop.is_set():
-            val = xinput_get_r2_value(self.index)
-            if val is None:
+            trigs = xinput_get_triggers(self.index)
+            if trigs is None:
                 # Not connected or error; back off a bit
                 time.sleep(0.05)
                 self.jitter.set_active(False)
                 self._signal_ui(False, backend_label="XInput", analog_01=0.0)
                 continue
+            val_l, val_r = trigs
+            if self.trigger == "l2":
+                val = val_l
+            elif self.trigger == "both":
+                val = max(val_l, val_r)
+            else:
+                val = val_r
 
             v01 = max(0.0, min(1.0, val / 255.0))
             pressed = val >= self.threshold
@@ -391,10 +427,11 @@ class R2Monitor:
 
             try:
                 pygame.event.pump()
-                # Determine axis if auto (-1)
-                axis = self.sdl_axis_index
-                if axis < 0:
-                    # Calibrate for ~1.5s; ask user to press R2 during this time
+                # Determine axes if auto (-1)
+                need_l2 = self.trigger in ("l2", "both")
+                need_r2 = self.trigger in ("r2", "both")
+                if (need_l2 and self.sdl_axis_l2_index < 0) or (need_r2 and self.sdl_axis_r2_index < 0):
+                    # Calibrate for ~1.5s; ask user to press the desired trigger(s)
                     axes_count = js.get_numaxes()
                     baseline = [0.0] * axes_count
                     scores = [0.0] * axes_count
@@ -415,36 +452,47 @@ class R2Monitor:
                             if d > scores[i]:
                                 scores[i] = d
                         time.sleep(0.01)
-                    try:
-                        best_axis = max(range(axes_count), key=lambda i: scores[i])
-                        if scores[best_axis] > 0.2:
-                            axis = best_axis
-                            self.sdl_axis_index = best_axis
-                        else:
-                            # fallback if movement too small
-                            axis = 5 if axes_count > 5 else max(0, axes_count - 1)
-                            self.sdl_axis_index = axis
-                    except ValueError:
-                        axis = 5 if axes_count > 5 else 0
-                        self.sdl_axis_index = axis
+                    # Pick the most responsive axes
+                    ranked = sorted(range(axes_count), key=lambda i: scores[i], reverse=True)
+                    if need_r2:
+                        self.sdl_axis_r2_index = ranked[0] if ranked else -1
+                    if need_l2:
+                        # Choose next best different axis if available
+                        self.sdl_axis_l2_index = -1
+                        for idx in ranked:
+                            if idx != self.sdl_axis_r2_index:
+                                self.sdl_axis_l2_index = idx
+                                break
+                        if self.sdl_axis_l2_index < 0 and ranked:
+                            self.sdl_axis_l2_index = ranked[0]
 
-                # Axis value typically in [-1, 1] where -1 is unpressed; some drivers give 0..1
-                val = float(js.get_axis(axis))
-                # Normalize to 0..1
-                if -1.001 <= val <= 1.001:
-                    v01 = (val + 1.0) * 0.5
+                def read_axis_01(i: int) -> float:
+                    val = float(js.get_axis(i)) if i >= 0 else 0.0
+                    if -1.001 <= val <= 1.001:
+                        return (val + 1.0) * 0.5
+                    return max(0.0, min(1.0, val))
+
+                v_l = read_axis_01(self.sdl_axis_l2_index) if need_l2 else 0.0
+                v_r = read_axis_01(self.sdl_axis_r2_index) if need_r2 else 0.0
+                if self.trigger == "l2":
+                    v01 = v_l
+                    label = f"SDL L2 axis {self.sdl_axis_l2_index}"
+                elif self.trigger == "r2":
+                    v01 = v_r
+                    label = f"SDL R2 axis {self.sdl_axis_r2_index}"
                 else:
-                    # already 0..1 or unusual; clamp
-                    v01 = max(0.0, min(1.0, val))
+                    v01 = max(v_l, v_r)
+                    label = f"SDL axes {self.sdl_axis_l2_index}/{self.sdl_axis_r2_index}"
+
                 pressed = v01 >= (self.threshold / 255.0)
                 if self.toggle_mode:
                     if pressed and not pressed_prev:
                         toggled = not toggled
                         self.jitter.set_active(toggled)
-                        self._signal_ui(toggled, backend_label=f"SDL axis {self.sdl_axis_index}", analog_01=v01)
+                        self._signal_ui(toggled, backend_label=label, analog_01=v01)
                 else:
                     self.jitter.set_active(pressed)
-                    self._signal_ui(pressed, backend_label=f"SDL axis {self.sdl_axis_index}", analog_01=v01)
+                    self._signal_ui(pressed, backend_label=label, analog_01=v01)
                 pressed_prev = pressed
                 last_ok = True
                 time.sleep(self.poll_interval_s)
@@ -466,10 +514,10 @@ class JitterApp(tk.Tk):
         self.jitter = JitterMouse(radius_px=4.0, events_per_second=500.0, rotations_per_second=80.0)
         self.monitor: Optional[R2Monitor] = None
         self.running = False
-        self.accent = "#6C63FF"  # Accent color
-        self.bg_dark = "#1E1E2E"
-        self.bg_mid = "#2A2A3C"
-        self.fg_text = "#E6E6F0"
+        self.accent = "#FFFFFF"  # Accent for active elements
+        self.bg_dark = "#111111"  # Matte black background
+        self.bg_mid = "#1B1B1B"   # Slightly lighter matte for panels
+        self.fg_text = "#FFFFFF"   # White lettering
 
         # Global style
         style = ttk.Style()
@@ -480,20 +528,19 @@ class JitterApp(tk.Tk):
         self.configure(bg=self.bg_dark)
         style.configure('TFrame', background=self.bg_mid)
         style.configure('TLabel', background=self.bg_mid, foreground=self.fg_text, font=("Segoe UI", 10))
-        style.configure('Header.TLabel', background=self.bg_dark, foreground='white', font=("Segoe UI Semibold", 14))
-        style.configure('Accent.TButton', font=("Segoe UI Semibold", 10))
-        style.map('Accent.TButton', background=[('active', self.accent)], foreground=[('active', 'white')])
+        style.configure('Header.TLabel', background=self.bg_dark, foreground=self.fg_text, font=("Segoe UI Semibold", 14))
+        style.configure('Accent.TButton', background="#2A2A2A", foreground=self.fg_text, font=("Segoe UI Semibold", 10))
+        style.map('Accent.TButton', background=[('active', '#333333')], foreground=[('active', self.fg_text)])
+        style.configure('TButton', background="#2A2A2A", foreground=self.fg_text)
         style.configure('TCheckbutton', background=self.bg_mid, foreground=self.fg_text)
         style.configure('Horizontal.TScale', background=self.bg_mid)
 
         # UI elements
-        # Header with gradient
-        header = tk.Canvas(self, height=64, highlightthickness=0, bg=self.bg_dark)
+        # Matte header (no gradient per request)
+        header = ttk.Frame(self, padding=10, style='TFrame')
         header.grid(row=0, column=0, sticky="ew")
-        self._draw_gradient(header, self.bg_dark, self.accent)
-        header.bind("<Configure>", lambda e: self._draw_gradient(header, self.bg_dark, self.accent))
-        header_lbl = ttk.Label(self, text="R2 Mouse Jitter", style='Header.TLabel')
-        header_lbl.place(x=16, y=16)
+        header_lbl = ttk.Label(header, text="R2 Mouse Jitter", style='Header.TLabel')
+        header_lbl.grid(row=0, column=0, sticky="w")
 
         main = ttk.Frame(self, padding=12, style='TFrame')
         main.grid(row=1, column=0, sticky="nsew")
@@ -511,34 +558,56 @@ class JitterApp(tk.Tk):
         self.backend_combo.grid(row=row, column=1, sticky="ew")
         row += 1
 
-        ttk.Label(main, text="SDL Axis (-1=Auto)").grid(row=row, column=0, sticky="w")
-        self.sdl_axis_var = tk.IntVar(value=-1)
-        self.sdl_axis_spin = ttk.Spinbox(main, from_=-1, to=15, textvariable=self.sdl_axis_var, width=5)
-        self.sdl_axis_spin.grid(row=row, column=1, sticky="e")
+        # SDL axis picks for L2/R2 when forcing SDL
+        ttk.Label(main, text="SDL L2 Axis (-1=Auto)").grid(row=row, column=0, sticky="w")
+        self.sdl_axis_l2_var = tk.IntVar(value=-1)
+        self.sdl_axis_l2_spin = ttk.Spinbox(main, from_=-1, to=15, textvariable=self.sdl_axis_l2_var, width=5)
+        self.sdl_axis_l2_spin.grid(row=row, column=1, sticky="e")
+        row += 1
+
+        ttk.Label(main, text="SDL R2 Axis (-1=Auto)").grid(row=row, column=0, sticky="w")
+        self.sdl_axis_r2_var = tk.IntVar(value=-1)
+        self.sdl_axis_r2_spin = ttk.Spinbox(main, from_=-1, to=15, textvariable=self.sdl_axis_r2_var, width=5)
+        self.sdl_axis_r2_spin.grid(row=row, column=1, sticky="e")
+        row += 1
+
+        ttk.Label(main, text="Trigger (R2/L2/Both)").grid(row=row, column=0, sticky="w")
+        self.trigger_var = tk.StringVar(value="R2")
+        self.trigger_combo = ttk.Combobox(main, textvariable=self.trigger_var, values=["R2", "L2", "Both"], state="readonly", width=10)
+        self.trigger_combo.grid(row=row, column=1, sticky="ew")
         row += 1
 
         ttk.Label(main, text="Strength (radius pixels)").grid(row=row, column=0, sticky="w")
         self.radius_var = tk.DoubleVar(value=4.0)
         self.radius_scale = ttk.Scale(main, from_=1.0, to=10.0, variable=self.radius_var, orient=tk.HORIZONTAL)
         self.radius_scale.grid(row=row, column=1, sticky="ew")
+        self.radius_val = ttk.Label(main, text=f"{self.radius_var.get():.1f}")
+        self.radius_val.grid(row=row, column=2, sticky="w")
         row += 1
 
         ttk.Label(main, text="Smoothness (events/sec)").grid(row=row, column=0, sticky="w")
         self.hz_var = tk.DoubleVar(value=500.0)
         self.hz_scale = ttk.Scale(main, from_=300.0, to=2000.0, variable=self.hz_var, orient=tk.HORIZONTAL)
         self.hz_scale.grid(row=row, column=1, sticky="ew")
+        self.hz_val = ttk.Label(main, text=f"{self.hz_var.get():.0f}")
+        self.hz_val.grid(row=row, column=2, sticky="w")
         row += 1
 
         ttk.Label(main, text="Rotation (rotations/sec)").grid(row=row, column=0, sticky="w")
         self.rps_var = tk.DoubleVar(value=100.0)
         self.rps_scale = ttk.Scale(main, from_=20.0, to=240.0, variable=self.rps_var, orient=tk.HORIZONTAL)
         self.rps_scale.grid(row=row, column=1, sticky="ew")
+        self.rps_val = ttk.Label(main, text=f"{self.rps_var.get():.0f}")
+        self.rps_val.grid(row=row, column=2, sticky="w")
+        
         row += 1
 
         ttk.Label(main, text="R2 Threshold (0-255)").grid(row=row, column=0, sticky="w")
         self.thresh_var = tk.IntVar(value=40)
         self.thresh_scale = ttk.Scale(main, from_=1, to=255, variable=self.thresh_var, orient=tk.HORIZONTAL)
         self.thresh_scale.grid(row=row, column=1, sticky="ew")
+        self.thresh_val = ttk.Label(main, text=f"{self.thresh_var.get():.0f}")
+        self.thresh_val.grid(row=row, column=2, sticky="w")
         row += 1
 
         self.toggle_var = tk.BooleanVar(value=False)
@@ -551,12 +620,25 @@ class JitterApp(tk.Tk):
         self.pull_speed_var = tk.DoubleVar(value=60.0)
         self.pull_speed_scale = ttk.Scale(main, from_=0.0, to=200.0, variable=self.pull_speed_var, orient=tk.HORIZONTAL)
         self.pull_speed_scale.grid(row=row, column=1, sticky="ew")
+        self.pull_speed_val = ttk.Label(main, text=f"{self.pull_speed_var.get():.0f}")
+        self.pull_speed_val.grid(row=row, column=2, sticky="w")
         row += 1
 
         ttk.Label(main, text="Pull Angle (deg, 0=right, 90=down)").grid(row=row, column=0, sticky="w")
         self.pull_angle_var = tk.DoubleVar(value=35.0)
         self.pull_angle_scale = ttk.Scale(main, from_=0.0, to=180.0, variable=self.pull_angle_var, orient=tk.HORIZONTAL)
         self.pull_angle_scale.grid(row=row, column=1, sticky="ew")
+        self.pull_angle_val = ttk.Label(main, text=f"{self.pull_angle_var.get():.0f}°")
+        self.pull_angle_val.grid(row=row, column=2, sticky="w")
+        row += 1
+
+        # Smoothing control (EMA on circle deltas)
+        ttk.Label(main, text="Smoothing (0–0.5)").grid(row=row, column=0, sticky="w")
+        self.smooth_var = tk.DoubleVar(value=0.15)
+        self.smooth_scale = ttk.Scale(main, from_=0.0, to=0.5, variable=self.smooth_var, orient=tk.HORIZONTAL)
+        self.smooth_scale.grid(row=row, column=1, sticky="ew")
+        self.smooth_val = ttk.Label(main, text=f"{self.smooth_var.get():.2f}")
+        self.smooth_val.grid(row=row, column=2, sticky="w")
         row += 1
 
         self.perf_var = tk.BooleanVar(value=False)
@@ -592,10 +674,14 @@ class JitterApp(tk.Tk):
             self.jitter.update_params(radius_px=self.radius_var.get(), events_per_second=self.hz_var.get(), rotations_per_second=self.rps_var.get())
             self.jitter.set_performance_mode(self.perf_var.get())
             self.jitter.update_pull(magnitude_px_per_sec=self.pull_speed_var.get(), angle_deg=self.pull_angle_var.get())
+            self.jitter.update_smoothing(self.smooth_var.get())
         except Exception as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
         self.active_label.configure(text="Settings applied", foreground="gray")
+
+        # Refresh value labels
+        self._refresh_value_labels()
 
     def on_start(self) -> None:
         if self.running:
@@ -615,8 +701,10 @@ class JitterApp(tk.Tk):
             jitter=self.jitter,
             ui_callback=self._update_active_ui,
             backend=backend_choice,  # try XInput first, then fallback SDL
-            sdl_axis_index=int(self.sdl_axis_var.get()),
+            sdl_axis_l2_index=int(self.sdl_axis_l2_var.get()),
+            sdl_axis_r2_index=int(self.sdl_axis_r2_var.get()),
             poll_interval_s=poll,
+            trigger=self.trigger_var.get(),
         )
         self.monitor.start()
         self.running = True
@@ -668,6 +756,34 @@ class JitterApp(tk.Tk):
             b = int(b1 + (b2 - b1) * i / steps)
             hex_color = f"#{r>>8:02x}{g>>8:02x}{b>>8:02x}"
             canvas.create_line(i, 0, i, height, tags=("grad",), fill=hex_color)
+
+    def _refresh_value_labels(self) -> None:
+        # Update numeric readouts next to sliders
+        self.radius_val.configure(text=f"{self.radius_var.get():.1f}")
+        self.hz_val.configure(text=f"{self.hz_var.get():.0f}")
+        self.rps_val.configure(text=f"{self.rps_var.get():.0f}")
+        self.thresh_val.configure(text=f"{self.thresh_var.get():.0f}")
+        self.pull_speed_val.configure(text=f"{self.pull_speed_var.get():.0f}")
+        self.pull_angle_val.configure(text=f"{self.pull_angle_var.get():.0f}°")
+        self.smooth_val.configure(text=f"{self.smooth_var.get():.2f}")
+
+        # Bind traces once (idempotent behavior)
+        for var, fmt, lbl in (
+            (self.radius_var, "{:.1f}", self.radius_val),
+            (self.hz_var, "{:.0f}", self.hz_val),
+            (self.rps_var, "{:.0f}", self.rps_val),
+            (self.thresh_var, "{:.0f}", self.thresh_val),
+            (self.pull_speed_var, "{:.0f}", self.pull_speed_val),
+            (self.pull_angle_var, "{:.0f}°", self.pull_angle_val),
+            (self.smooth_var, "{:.2f}", self.smooth_val),
+        ):
+            def _make_cb(v=var, f=fmt, l=lbl):
+                return lambda *args: l.configure(text=f.format(v.get()))
+            try:
+                # If already traced, ignore
+                var.trace_add('write', _make_cb())
+            except Exception:
+                pass
 
 
 def main() -> int:
