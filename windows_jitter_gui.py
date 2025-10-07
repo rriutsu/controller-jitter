@@ -204,12 +204,14 @@ class JitterMouse:
 
 
 class R2Monitor:
-    def __init__(self, controller_index: int, threshold: int, toggle_mode: bool, jitter: JitterMouse, ui_callback=None) -> None:
-        self.index = controller_index
+    def __init__(self, controller_index: int, threshold: int, toggle_mode: bool, jitter: JitterMouse, ui_callback=None, backend: str = "auto", sdl_axis_index: int = -1) -> None:
+        self.index = int(controller_index)
         self.threshold = max(0, min(255, int(threshold)))
-        self.toggle_mode = toggle_mode
+        self.toggle_mode = bool(toggle_mode)
         self.jitter = jitter
         self.ui_callback = ui_callback  # function(active: bool)
+        self.backend = backend.lower() if backend else "auto"
+        self.sdl_axis_index = int(sdl_axis_index)
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -226,17 +228,52 @@ class R2Monitor:
         if self._thread:
             self._thread.join(timeout=1.0)
 
+    def _signal_ui(self, active: bool, backend_label: Optional[str] = None) -> None:
+        if not self.ui_callback:
+            return
+        label = backend_label or ""
+        # Notify UI with both active state and backend label
+        try:
+            self.ui_callback(active, label)
+        except TypeError:
+            # Backward compat: older UI callback with single arg
+            self.ui_callback(active)
+
     def _run(self) -> None:
+        mode = self.backend
+        if mode == "xinput":
+            self._run_xinput()
+            return
+        if mode == "sdl":
+            self._run_sdl()
+            return
+
+        # auto: try XInput first, then fallback to SDL if not available
+        trial_deadline = time.perf_counter() + 2.0  # 2 seconds trial
+        had_value = False
+        while not self._stop.is_set() and time.perf_counter() < trial_deadline:
+            val = xinput_get_r2_value(self.index)
+            if val is not None:
+                had_value = True
+                break
+            time.sleep(0.02)
+        if had_value:
+            self._run_xinput()
+        else:
+            self._run_sdl()
+
+    def _run_xinput(self) -> None:
         pressed_prev = False
         toggled = False
+        # Inform UI that backend is XInput
+        self._signal_ui(False, backend_label="XInput")
         while not self._stop.is_set():
             val = xinput_get_r2_value(self.index)
             if val is None:
                 # Not connected or error; back off a bit
-                time.sleep(0.1)
-                if self.ui_callback:
-                    self.ui_callback(False)
+                time.sleep(0.05)
                 self.jitter.set_active(False)
+                self._signal_ui(False, backend_label="XInput")
                 continue
 
             pressed = val >= self.threshold
@@ -244,15 +281,114 @@ class R2Monitor:
                 if pressed and not pressed_prev:
                     toggled = not toggled
                     self.jitter.set_active(toggled)
-                    if self.ui_callback:
-                        self.ui_callback(toggled)
+                    self._signal_ui(toggled, backend_label="XInput")
             else:
                 self.jitter.set_active(pressed)
-                if self.ui_callback:
-                    self.ui_callback(pressed)
+                self._signal_ui(pressed, backend_label="XInput")
 
             pressed_prev = pressed
             time.sleep(0.002)  # ~500 Hz polling
+
+    def _run_sdl(self) -> None:
+        # Lazy import to avoid dependency unless needed
+        try:
+            import pygame  # type: ignore
+        except Exception:
+            # Cannot fallback; keep inactive
+            while not self._stop.is_set():
+                self.jitter.set_active(False)
+                time.sleep(0.25)
+            return
+
+        pygame.init()
+        pygame.joystick.init()
+        last_ok = False
+        pressed_prev = False
+        toggled = False
+
+        def ensure_joystick():
+            if pygame.joystick.get_count() <= self.index:
+                return None
+            js = pygame.joystick.Joystick(self.index)
+            js.init()
+            return js
+
+        js = ensure_joystick()
+        self._signal_ui(False, backend_label="SDL")
+        while not self._stop.is_set():
+            if js is None:
+                pygame.joystick.quit()
+                pygame.joystick.init()
+                js = ensure_joystick()
+                last_ok = False
+                time.sleep(0.25)
+                continue
+
+            try:
+                pygame.event.pump()
+                # Determine axis if auto (-1)
+                axis = self.sdl_axis_index
+                if axis < 0:
+                    # Calibrate for ~1.5s; ask user to press R2 during this time
+                    axes_count = js.get_numaxes()
+                    baseline = [0.0] * axes_count
+                    scores = [0.0] * axes_count
+                    for i in range(axes_count):
+                        try:
+                            baseline[i] = float(js.get_axis(i))
+                        except Exception:
+                            baseline[i] = 0.0
+                    start = time.perf_counter()
+                    while (time.perf_counter() - start) < 1.5 and not self._stop.is_set():
+                        pygame.event.pump()
+                        for i in range(axes_count):
+                            try:
+                                v = float(js.get_axis(i))
+                            except Exception:
+                                v = baseline[i]
+                            d = abs(v - baseline[i])
+                            if d > scores[i]:
+                                scores[i] = d
+                        time.sleep(0.01)
+                    try:
+                        best_axis = max(range(axes_count), key=lambda i: scores[i])
+                        if scores[best_axis] > 0.2:
+                            axis = best_axis
+                            self.sdl_axis_index = best_axis
+                        else:
+                            # fallback if movement too small
+                            axis = 5 if axes_count > 5 else max(0, axes_count - 1)
+                            self.sdl_axis_index = axis
+                    except ValueError:
+                        axis = 5 if axes_count > 5 else 0
+                        self.sdl_axis_index = axis
+
+                # Axis value typically in [-1, 1] where -1 is unpressed; some drivers give 0..1
+                val = float(js.get_axis(axis))
+                # Normalize to 0..1
+                if -1.001 <= val <= 1.001:
+                    v01 = (val + 1.0) * 0.5
+                else:
+                    # already 0..1 or unusual; clamp
+                    v01 = max(0.0, min(1.0, val))
+                pressed = v01 >= (self.threshold / 255.0)
+                if self.toggle_mode:
+                    if pressed and not pressed_prev:
+                        toggled = not toggled
+                        self.jitter.set_active(toggled)
+                        self._signal_ui(toggled, backend_label=f"SDL axis {self.sdl_axis_index}")
+                else:
+                    self.jitter.set_active(pressed)
+                    self._signal_ui(pressed, backend_label=f"SDL axis {self.sdl_axis_index}")
+                pressed_prev = pressed
+                last_ok = True
+                time.sleep(0.002)
+            except Exception:
+                # device may have been disconnected or axis invalid; reset
+                last_ok = False
+                self.jitter.set_active(False)
+                self._signal_ui(False, backend_label="SDL")
+                time.sleep(0.25)
 
 
 class JitterApp(tk.Tk):
@@ -343,6 +479,8 @@ class JitterApp(tk.Tk):
             toggle_mode=bool(self.toggle_var.get()),
             jitter=self.jitter,
             ui_callback=self._update_active_ui,
+            backend="auto",  # try XInput first, then fallback SDL
+            sdl_axis_index=5,  # typical for DualSense right trigger in pygame
         )
         self.monitor.start()
         self.running = True
@@ -363,12 +501,13 @@ class JitterApp(tk.Tk):
         self.stop_btn.configure(state=tk.DISABLED)
         self.active_label.configure(text="Status: Stopped", foreground="gray")
 
-    def _update_active_ui(self, active: bool) -> None:
+    def _update_active_ui(self, active: bool, backend_label: str = "") -> None:
         # This is called from a background thread; schedule to main thread
         def _apply():
             if not self.running:
                 return
-            self.active_label.configure(text=f"Status: {'ACTIVE' if active else 'Running'}", foreground=("red" if active else "green"))
+            suffix = f" [{backend_label}]" if backend_label else ""
+            self.active_label.configure(text=f"Status: {'ACTIVE' if active else 'Running'}{suffix}", foreground=("red" if active else "green"))
         self.after(0, _apply)
 
     def on_close(self) -> None:
