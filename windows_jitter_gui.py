@@ -47,16 +47,42 @@ class INPUT(ctypes.Structure):
 user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
 user32.SendInput.restype = ctypes.c_uint
 
+# Pre-allocate a reusable INPUT structure to reduce per-event allocations
+_GLOBAL_INPUT = INPUT(type=INPUT_MOUSE)
 
 def send_mouse_rel(dx: int, dy: int) -> None:
-    inp = INPUT(type=INPUT_MOUSE)
-    inp.mi = MOUSEINPUT(dx=dx, dy=dy, mouseData=0, dwFlags=MOUSEEVENTF_MOVE, time=0, dwExtraInfo=None)
-    sent = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    mi = _GLOBAL_INPUT.mi
+    mi.dx = dx
+    mi.dy = dy
+    mi.mouseData = 0
+    mi.dwFlags = MOUSEEVENTF_MOVE
+    mi.time = 0
+    mi.dwExtraInfo = None
+    sent = user32.SendInput(1, ctypes.byref(_GLOBAL_INPUT), ctypes.sizeof(INPUT))
     if sent != 1:
         err = ctypes.get_last_error()
         # Avoid spamming UI; errors can occur if desktop/session focus changes
         # print(f"SendInput failed: {err}")
         _ = err
+
+# Priority helpers
+kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+kernel32.GetCurrentThread.restype = ctypes.c_void_p
+kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+kernel32.SetPriorityClass.restype = ctypes.c_int
+kernel32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+kernel32.SetThreadPriority.restype = ctypes.c_int
+
+HIGH_PRIORITY_CLASS = 0x00000080
+THREAD_PRIORITY_HIGHEST = 2
+
+def _boost_priorities() -> None:
+    h_proc = kernel32.GetCurrentProcess()
+    if h_proc:
+        kernel32.SetPriorityClass(h_proc, HIGH_PRIORITY_CLASS)
+    h_thread = kernel32.GetCurrentThread()
+    if h_thread:
+        kernel32.SetThreadPriority(h_thread, THREAD_PRIORITY_HIGHEST)
 
 # XInput
 _xinput = None
@@ -103,7 +129,7 @@ def xinput_get_r2_value(index: int) -> Optional[int]:
 
 
 class JitterMouse:
-    def __init__(self, radius_px: float, events_per_second: float, rotations_per_second: float) -> None:
+    def __init__(self, radius_px: float, events_per_second: float, rotations_per_second: float, performance_mode: bool = False) -> None:
         if events_per_second <= 0:
             raise ValueError("events_per_second must be > 0")
         if rotations_per_second < 0:
@@ -111,6 +137,7 @@ class JitterMouse:
         self._radius = float(radius_px)
         self._hz = float(events_per_second)
         self._rps = float(rotations_per_second)
+        self._performance_mode = bool(performance_mode)
 
         self._active = False
         self._active_lock = threading.Lock()
@@ -122,6 +149,9 @@ class JitterMouse:
     def set_active(self, active: bool) -> None:
         with self._active_lock:
             self._active = active
+
+    def set_performance_mode(self, enabled: bool) -> None:
+        self._performance_mode = bool(enabled)
 
     def update_params(self, radius_px: Optional[float] = None, events_per_second: Optional[float] = None, rotations_per_second: Optional[float] = None) -> None:
         with self._param_lock:
@@ -147,6 +177,12 @@ class JitterMouse:
     def _run(self) -> None:
         # Improve sleep precision
         _set_timer_resolution(1)
+        # Optional: boost process and thread priority for lower latency
+        if self._performance_mode:
+            try:
+                _boost_priorities()
+            except Exception:
+                pass
         try:
             angle = 0.0
             last_cos = math.cos(angle)
@@ -204,7 +240,7 @@ class JitterMouse:
 
 
 class R2Monitor:
-    def __init__(self, controller_index: int, threshold: int, toggle_mode: bool, jitter: JitterMouse, ui_callback=None, backend: str = "auto", sdl_axis_index: int = -1) -> None:
+    def __init__(self, controller_index: int, threshold: int, toggle_mode: bool, jitter: JitterMouse, ui_callback=None, backend: str = "auto", sdl_axis_index: int = -1, poll_interval_s: float = 0.002) -> None:
         self.index = int(controller_index)
         self.threshold = max(0, min(255, int(threshold)))
         self.toggle_mode = bool(toggle_mode)
@@ -212,6 +248,7 @@ class R2Monitor:
         self.ui_callback = ui_callback  # function(active: bool)
         self.backend = backend.lower() if backend else "auto"
         self.sdl_axis_index = int(sdl_axis_index)
+        self.poll_interval_s = float(max(0.001, poll_interval_s))
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -228,16 +265,19 @@ class R2Monitor:
         if self._thread:
             self._thread.join(timeout=1.0)
 
-    def _signal_ui(self, active: bool, backend_label: Optional[str] = None) -> None:
+    def _signal_ui(self, active: bool, backend_label: Optional[str] = None, analog_01: Optional[float] = None) -> None:
         if not self.ui_callback:
             return
         label = backend_label or ""
-        # Notify UI with both active state and backend label
+        # Notify UI with active state, backend and analog value if supported
         try:
-            self.ui_callback(active, label)
+            self.ui_callback(active, label, analog_01)
         except TypeError:
             # Backward compat: older UI callback with single arg
-            self.ui_callback(active)
+            try:
+                self.ui_callback(active, label)
+            except TypeError:
+                self.ui_callback(active)
 
     def _run(self) -> None:
         mode = self.backend
@@ -266,28 +306,29 @@ class R2Monitor:
         pressed_prev = False
         toggled = False
         # Inform UI that backend is XInput
-        self._signal_ui(False, backend_label="XInput")
+        self._signal_ui(False, backend_label="XInput", analog_01=0.0)
         while not self._stop.is_set():
             val = xinput_get_r2_value(self.index)
             if val is None:
                 # Not connected or error; back off a bit
                 time.sleep(0.05)
                 self.jitter.set_active(False)
-                self._signal_ui(False, backend_label="XInput")
+                self._signal_ui(False, backend_label="XInput", analog_01=0.0)
                 continue
 
+            v01 = max(0.0, min(1.0, val / 255.0))
             pressed = val >= self.threshold
             if self.toggle_mode:
                 if pressed and not pressed_prev:
                     toggled = not toggled
                     self.jitter.set_active(toggled)
-                    self._signal_ui(toggled, backend_label="XInput")
+                    self._signal_ui(toggled, backend_label="XInput", analog_01=v01)
             else:
                 self.jitter.set_active(pressed)
-                self._signal_ui(pressed, backend_label="XInput")
+                self._signal_ui(pressed, backend_label="XInput", analog_01=v01)
 
             pressed_prev = pressed
-            time.sleep(0.002)  # ~500 Hz polling
+            time.sleep(self.poll_interval_s)
 
     def _run_sdl(self) -> None:
         # Lazy import to avoid dependency unless needed
@@ -314,7 +355,7 @@ class R2Monitor:
             return js
 
         js = ensure_joystick()
-        self._signal_ui(False, backend_label="SDL")
+        self._signal_ui(False, backend_label="SDL", analog_01=0.0)
         while not self._stop.is_set():
             if js is None:
                 pygame.joystick.quit()
@@ -376,18 +417,18 @@ class R2Monitor:
                     if pressed and not pressed_prev:
                         toggled = not toggled
                         self.jitter.set_active(toggled)
-                        self._signal_ui(toggled, backend_label=f"SDL axis {self.sdl_axis_index}")
+                        self._signal_ui(toggled, backend_label=f"SDL axis {self.sdl_axis_index}", analog_01=v01)
                 else:
                     self.jitter.set_active(pressed)
-                    self._signal_ui(pressed, backend_label=f"SDL axis {self.sdl_axis_index}")
+                    self._signal_ui(pressed, backend_label=f"SDL axis {self.sdl_axis_index}", analog_01=v01)
                 pressed_prev = pressed
                 last_ok = True
-                time.sleep(0.002)
+                time.sleep(self.poll_interval_s)
             except Exception:
                 # device may have been disconnected or axis invalid; reset
                 last_ok = False
                 self.jitter.set_active(False)
-                self._signal_ui(False, backend_label="SDL")
+                self._signal_ui(False, backend_label="SDL", analog_01=0.0)
                 time.sleep(0.25)
 
 
@@ -401,16 +442,55 @@ class JitterApp(tk.Tk):
         self.jitter = JitterMouse(radius_px=4.0, events_per_second=500.0, rotations_per_second=80.0)
         self.monitor: Optional[R2Monitor] = None
         self.running = False
+        self.accent = "#6C63FF"  # Accent color
+        self.bg_dark = "#1E1E2E"
+        self.bg_mid = "#2A2A3C"
+        self.fg_text = "#E6E6F0"
+
+        # Global style
+        style = ttk.Style()
+        try:
+            style.theme_use('clam')
+        except Exception:
+            pass
+        self.configure(bg=self.bg_dark)
+        style.configure('TFrame', background=self.bg_mid)
+        style.configure('TLabel', background=self.bg_mid, foreground=self.fg_text, font=("Segoe UI", 10))
+        style.configure('Header.TLabel', background=self.bg_dark, foreground='white', font=("Segoe UI Semibold", 14))
+        style.configure('Accent.TButton', font=("Segoe UI Semibold", 10))
+        style.map('Accent.TButton', background=[('active', self.accent)], foreground=[('active', 'white')])
+        style.configure('TCheckbutton', background=self.bg_mid, foreground=self.fg_text)
+        style.configure('Horizontal.TScale', background=self.bg_mid)
 
         # UI elements
-        main = ttk.Frame(self, padding=10)
-        main.grid(row=0, column=0, sticky="nsew")
+        # Header with gradient
+        header = tk.Canvas(self, height=64, highlightthickness=0, bg=self.bg_dark)
+        header.grid(row=0, column=0, sticky="ew")
+        self._draw_gradient(header, self.bg_dark, self.accent)
+        header.bind("<Configure>", lambda e: self._draw_gradient(header, self.bg_dark, self.accent))
+        header_lbl = ttk.Label(self, text="R2 Mouse Jitter", style='Header.TLabel')
+        header_lbl.place(x=16, y=16)
+
+        main = ttk.Frame(self, padding=12, style='TFrame')
+        main.grid(row=1, column=0, sticky="nsew")
 
         row = 0
         ttk.Label(main, text="Controller Index (0-3)").grid(row=row, column=0, sticky="w")
         self.index_var = tk.IntVar(value=0)
         self.index_spin = ttk.Spinbox(main, from_=0, to=3, textvariable=self.index_var, width=5)
         self.index_spin.grid(row=row, column=1, sticky="e")
+        row += 1
+
+        ttk.Label(main, text="Backend").grid(row=row, column=0, sticky="w")
+        self.backend_var = tk.StringVar(value="Auto")
+        self.backend_combo = ttk.Combobox(main, textvariable=self.backend_var, values=["Auto", "XInput", "SDL"], state="readonly", width=10)
+        self.backend_combo.grid(row=row, column=1, sticky="ew")
+        row += 1
+
+        ttk.Label(main, text="SDL Axis (-1=Auto)").grid(row=row, column=0, sticky="w")
+        self.sdl_axis_var = tk.IntVar(value=-1)
+        self.sdl_axis_spin = ttk.Spinbox(main, from_=-1, to=15, textvariable=self.sdl_axis_var, width=5)
+        self.sdl_axis_spin.grid(row=row, column=1, sticky="e")
         row += 1
 
         ttk.Label(main, text="Strength (radius pixels)").grid(row=row, column=0, sticky="w")
@@ -442,13 +522,23 @@ class JitterApp(tk.Tk):
         self.toggle_chk.grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
 
+        self.perf_var = tk.BooleanVar(value=False)
+        self.perf_chk = ttk.Checkbutton(main, text="Performance Mode (higher priority, faster polling)", variable=self.perf_var)
+        self.perf_chk.grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
+        ttk.Label(main, text="R2 Level").grid(row=row, column=0, sticky="w")
+        self.r2_level = ttk.Progressbar(main, orient=tk.HORIZONTAL, length=180, mode='determinate', maximum=100)
+        self.r2_level.grid(row=row, column=1, sticky="ew")
+        row += 1
+
         self.active_label = ttk.Label(main, text="Status: Idle", foreground="gray")
         self.active_label.grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
 
         btn_frame = ttk.Frame(main)
         btn_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self.start_btn = ttk.Button(btn_frame, text="Start", command=self.on_start)
+        self.start_btn = ttk.Button(btn_frame, text="Start", command=self.on_start, style='Accent.TButton')
         self.start_btn.pack(side=tk.LEFT)
         self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self.on_stop, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=(6, 0))
@@ -463,6 +553,7 @@ class JitterApp(tk.Tk):
     def on_apply(self) -> None:
         try:
             self.jitter.update_params(radius_px=self.radius_var.get(), events_per_second=self.hz_var.get(), rotations_per_second=self.rps_var.get())
+            self.jitter.set_performance_mode(self.perf_var.get())
         except Exception as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
@@ -473,14 +564,21 @@ class JitterApp(tk.Tk):
             return
         self.on_apply()
         self.jitter.start()
+        backend_choice = self.backend_var.get().lower()
+        if backend_choice not in ("auto", "xinput", "sdl"):
+            backend_choice = "auto"
+
+        poll = 0.001 if self.perf_var.get() else 0.002
+
         self.monitor = R2Monitor(
             controller_index=int(self.index_var.get()),
             threshold=int(self.thresh_var.get()),
             toggle_mode=bool(self.toggle_var.get()),
             jitter=self.jitter,
             ui_callback=self._update_active_ui,
-            backend="auto",  # try XInput first, then fallback SDL
-            sdl_axis_index=5,  # typical for DualSense right trigger in pygame
+            backend=backend_choice,  # try XInput first, then fallback SDL
+            sdl_axis_index=int(self.sdl_axis_var.get()),
+            poll_interval_s=poll,
         )
         self.monitor.start()
         self.running = True
@@ -501,13 +599,15 @@ class JitterApp(tk.Tk):
         self.stop_btn.configure(state=tk.DISABLED)
         self.active_label.configure(text="Status: Stopped", foreground="gray")
 
-    def _update_active_ui(self, active: bool, backend_label: str = "") -> None:
+    def _update_active_ui(self, active: bool, backend_label: str = "", analog: Optional[float] = None) -> None:
         # This is called from a background thread; schedule to main thread
         def _apply():
             if not self.running:
                 return
             suffix = f" [{backend_label}]" if backend_label else ""
             self.active_label.configure(text=f"Status: {'ACTIVE' if active else 'Running'}{suffix}", foreground=("red" if active else "green"))
+            if analog is not None:
+                self.r2_level['value'] = int(round(analog * 100))
         self.after(0, _apply)
 
     def on_close(self) -> None:
@@ -515,6 +615,21 @@ class JitterApp(tk.Tk):
             self.on_stop()
         finally:
             self.destroy()
+
+    def _draw_gradient(self, canvas: tk.Canvas, color1: str, color2: str) -> None:
+        canvas.delete("grad")
+        width = canvas.winfo_width() or 600
+        height = canvas.winfo_height() or 64
+        # Simple horizontal gradient
+        steps = max(1, width)
+        r1, g1, b1 = self.winfo_rgb(color1)
+        r2, g2, b2 = self.winfo_rgb(color2)
+        for i in range(steps):
+            r = int(r1 + (r2 - r1) * i / steps)
+            g = int(g1 + (g2 - g1) * i / steps)
+            b = int(b1 + (b2 - b1) * i / steps)
+            hex_color = f"#{r>>8:02x}{g>>8:02x}{b>>8:02x}"
+            canvas.create_line(i, 0, i, height, tags=("grad",), fill=hex_color)
 
 
 def main() -> int:
