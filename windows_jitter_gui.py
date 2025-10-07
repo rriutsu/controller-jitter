@@ -138,6 +138,9 @@ class JitterMouse:
         self._hz = float(events_per_second)
         self._rps = float(rotations_per_second)
         self._performance_mode = bool(performance_mode)
+        # Pull (recoil) in pixels per second along X (right +) and Y (down +)
+        self._pull_dx_per_sec = 0.0
+        self._pull_dy_per_sec = 0.0
 
         self._active = False
         self._active_lock = threading.Lock()
@@ -152,6 +155,12 @@ class JitterMouse:
 
     def set_performance_mode(self, enabled: bool) -> None:
         self._performance_mode = bool(enabled)
+
+    def update_pull(self, magnitude_px_per_sec: float, angle_deg: float) -> None:
+        # 0° = right, 90° = down, 180° = left, 270° = up
+        rad = math.radians(angle_deg)
+        self._pull_dx_per_sec = float(magnitude_px_per_sec) * math.cos(rad)
+        self._pull_dy_per_sec = float(magnitude_px_per_sec) * math.sin(rad)
 
     def update_params(self, radius_px: Optional[float] = None, events_per_second: Optional[float] = None, rotations_per_second: Optional[float] = None) -> None:
         with self._param_lock:
@@ -201,11 +210,21 @@ class JitterMouse:
                 step_seconds = 1.0 / hz
                 angle_step = 2.0 * math.pi * (rps / hz)
 
+                target = last_tick + step_seconds
                 now = time.perf_counter()
-                sleep_time = (last_tick + step_seconds) - now
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                    now = time.perf_counter()
+                remaining = target - now
+                if remaining > 0:
+                    if self._performance_mode and remaining > 0.0006:
+                        # Sleep most of the time, then busy-wait for the final few hundred microseconds
+                        time.sleep(remaining - 0.0004)
+                        while True:
+                            now = time.perf_counter()
+                            if now >= target:
+                                break
+                    else:
+                        # Regular precise sleep
+                        time.sleep(remaining)
+                        now = time.perf_counter()
                 last_tick = now
 
                 with self._active_lock:
@@ -221,13 +240,18 @@ class JitterMouse:
                     last_sin = cur_sin
                     continue
 
+                # Circular component
                 dx_f = radius * (cur_cos - last_cos)
                 dy_f = radius * (cur_sin - last_sin)
                 last_cos = cur_cos
                 last_sin = cur_sin
 
-                residual_x += dx_f
-                residual_y += dy_f
+                # Recoil pull component (constant drift per second)
+                drift_x = self._pull_dx_per_sec * step_seconds
+                drift_y = self._pull_dy_per_sec * step_seconds
+
+                residual_x += dx_f + drift_x
+                residual_y += dy_f + drift_y
                 dx = int(round(residual_x))
                 dy = int(round(residual_y))
                 residual_x -= dx
@@ -501,13 +525,13 @@ class JitterApp(tk.Tk):
 
         ttk.Label(main, text="Smoothness (events/sec)").grid(row=row, column=0, sticky="w")
         self.hz_var = tk.DoubleVar(value=500.0)
-        self.hz_scale = ttk.Scale(main, from_=100.0, to=1000.0, variable=self.hz_var, orient=tk.HORIZONTAL)
+        self.hz_scale = ttk.Scale(main, from_=300.0, to=2000.0, variable=self.hz_var, orient=tk.HORIZONTAL)
         self.hz_scale.grid(row=row, column=1, sticky="ew")
         row += 1
 
         ttk.Label(main, text="Rotation (rotations/sec)").grid(row=row, column=0, sticky="w")
-        self.rps_var = tk.DoubleVar(value=80.0)
-        self.rps_scale = ttk.Scale(main, from_=10.0, to=200.0, variable=self.rps_var, orient=tk.HORIZONTAL)
+        self.rps_var = tk.DoubleVar(value=100.0)
+        self.rps_scale = ttk.Scale(main, from_=20.0, to=240.0, variable=self.rps_var, orient=tk.HORIZONTAL)
         self.rps_scale.grid(row=row, column=1, sticky="ew")
         row += 1
 
@@ -520,6 +544,19 @@ class JitterApp(tk.Tk):
         self.toggle_var = tk.BooleanVar(value=False)
         self.toggle_chk = ttk.Checkbutton(main, text="Toggle mode (press to toggle)", variable=self.toggle_var)
         self.toggle_chk.grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
+        # Recoil pull controls (down-right)
+        ttk.Label(main, text="Recoil Pull Speed (px/sec)").grid(row=row, column=0, sticky="w")
+        self.pull_speed_var = tk.DoubleVar(value=60.0)
+        self.pull_speed_scale = ttk.Scale(main, from_=0.0, to=200.0, variable=self.pull_speed_var, orient=tk.HORIZONTAL)
+        self.pull_speed_scale.grid(row=row, column=1, sticky="ew")
+        row += 1
+
+        ttk.Label(main, text="Pull Angle (deg, 0=right, 90=down)").grid(row=row, column=0, sticky="w")
+        self.pull_angle_var = tk.DoubleVar(value=35.0)
+        self.pull_angle_scale = ttk.Scale(main, from_=0.0, to=180.0, variable=self.pull_angle_var, orient=tk.HORIZONTAL)
+        self.pull_angle_scale.grid(row=row, column=1, sticky="ew")
         row += 1
 
         self.perf_var = tk.BooleanVar(value=False)
@@ -554,6 +591,7 @@ class JitterApp(tk.Tk):
         try:
             self.jitter.update_params(radius_px=self.radius_var.get(), events_per_second=self.hz_var.get(), rotations_per_second=self.rps_var.get())
             self.jitter.set_performance_mode(self.perf_var.get())
+            self.jitter.update_pull(magnitude_px_per_sec=self.pull_speed_var.get(), angle_deg=self.pull_angle_var.get())
         except Exception as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
